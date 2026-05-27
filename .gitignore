@@ -1,0 +1,28 @@
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.py[cod]
+
+# Docker data
+.docker_data/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Node modules
+node_modules/
+npm-debug.log*
+
+# Local environment files
+.env
+.env.local
+
+# Docker volume data paths (Crucial)
+.docker_data/
