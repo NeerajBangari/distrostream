@@ -26,3 +26,21 @@ npm-debug.log*
 
 # Docker volume data paths (Crucial)
 .docker_data/
+
+# Virtual environment
+venv/
+.venv/
+ENV/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local media/FFmpeg outputs (if you are saving transcoded files locally)
+*.mp4
+*.m3u8
+*.ts
+
+# Executables
+*.exe
+apps/transcoder-worker/ffmpeg.exe
