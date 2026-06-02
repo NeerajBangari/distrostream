@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DistroStream Live Notification Monitor</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #121212; color: #e0e0e0; padding: 30px; }
+        .card { background: #1e1e1e; padding: 20px; border-radius: 8px; border: 1px solid #2d2d2d; max-width: 800px; margin: 0 auto; }
+        h2 { margin-top: 0; color: #ffffff; border-bottom: 2px solid #2d2d2d; padding-bottom: 10px; }
+        #status { font-size: 1.1em; margin-bottom: 20px; padding: 10px; border-radius: 4px; background: #2a2a2a; display: inline-block; }
+        #logs { background: #000000; padding: 15px; border-radius: 6px; height: 350px; overflow-y: auto; font-family: 'Consolas', monospace; border: 1px solid #333; font-size: 0.95em; }
+        .info { color: #888; }
+        .success { color: #4caf50; font-weight: bold; }
+        .event-alert { color: #00adb5; background: rgba(0, 173, 181, 0.1); padding: 8px; border-left: 4px solid #00adb5; margin: 10px 0; border-radius: 0 4px 4px 0; }
+    </style>
+</head>
+<body>
+
+    <div class="card">
+        <h2>🎧 DistroStream System Event Monitor</h2>
+        <div id="status">🔄 Initializing handshake...</div>
+        
+        <h3>Live Event Feed</h3>
+        <div id="logs"></div>
+    </div>
+
+    <script>
+        const logsDiv = document.getElementById('logs');
+        const statusDiv = document.getElementById('status');
+        
+        // Force explicit IPv4 path to match your local Node.js environment setup
+        const socketUrl = 'ws://127.0.0.1:8080/api/v1/notifications/connect';
+        const ws = new WebSocket(socketUrl);
+
+        ws.onopen = () => {
+            statusDiv.innerHTML = '🟢 <strong>Connected to Gateway (Port 8080)</strong>';
+            statusDiv.style.background = '#1b5e20';
+            log('🔌 Live socket linkage established with Node.js Notification Service.', 'success');
+        };
+
+        ws.onmessage = (event) => {
+            console.log("Raw payload caught:", event.data);
+            const parsed = JSON.parse(event.data);
+            
+            if (parsed.event === 'VIDEO_TRANSCODING_COMPLETE') {
+                log(`🚨 BROADCAST RECEIVED: Video [${parsed.data.video_id}] processing is complete!`, 'event-alert');
+                log(`🔗 Public Playback URL: ${parsed.data.playback_url}`, 'success');
+            } else {
+                log(`📥 Generic Payload Received: ${event.data}`, 'info');
+            }
+        };
+
+        ws.onclose = () => {
+            statusDiv.innerHTML = '🔴 <strong>Disconnected from Gateway</strong>';
+            statusDiv.style.background = '#b71c1c';
+            log('❌ Connection terminated by host.', 'info');
+        };
+
+        ws.onerror = (err) => {
+            log('❌ Browser socket connection failed. Make sure server.js is actively running.', 'info');
+        };
+
+        function log(message, className = '') {
+            const p = document.createElement('p');
+            p.className = className;
+            p.innerHTML = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logsDiv.appendChild(p);
+            logsDiv.scrollTop = logsDiv.scrollHeight;
+        }
+    </script>
+</body>
+</html>
