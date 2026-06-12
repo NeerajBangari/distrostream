@@ -6,6 +6,9 @@ from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 import boto3
 from botocore.client import Config
 
+# Import shared database model and session factory
+from database import VideoMetadata, SessionLocal
+
 # Configuration
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "127.0.0.1:9092")
 CONSUME_TOPIC = "raw-video-events"
@@ -18,7 +21,7 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadminpassword")
 RAW_BUCKET = "raw-videos"
 PROCESSED_BUCKET = "processed-streams"
 
-# Initialize standard synchronous S3 Client (boto3)
+# Initialize standard synchronous S3 Client
 s3_client = boto3.client(
     's3',
     endpoint_url=MINIO_ENDPOINT,
@@ -27,14 +30,56 @@ s3_client = boto3.client(
     config=Config(signature_version='s3v4')
 )
 
+
+def sync_update_db_success(video_id: str, playback_url: str):
+    """Executes the database updates for a successfully transcoded stream."""
+    db = SessionLocal()
+    try:
+        # Strip any accidental extensions to match Ingest Service logic perfectly
+        clean_id = os.path.splitext(video_id)[0]
+        video_record = db.query(VideoMetadata).filter(VideoMetadata.video_id == clean_id).first()
+        
+        if video_record:
+            video_record.status = "COMPLETED"
+            video_record.playback_url = playback_url
+            db.commit()
+            print(f"💾 Relational Database updated successfully: [{clean_id}] -> COMPLETED")
+        else:
+            print(f"⚠️ Database Sync Alert: No record found matching key [{clean_id}]")
+    except Exception as e:
+        print(f"❌ Database Commit Error: {str(e)}")
+    finally:
+        db.close()
+
+
+def sync_update_db_failed(video_id: str):
+    """Executes fallback error handling state toggles inside PostgreSQL."""
+    db = SessionLocal()
+    try:
+        clean_id = os.path.splitext(video_id)[0]
+        video_record = db.query(VideoMetadata).filter(VideoMetadata.video_id == clean_id).first()
+        if video_record:
+            video_record.status = "FAILED"
+            db.commit()
+            print(f"💾 Video pipeline state toggled to FAILED for: [{clean_id}]")
+    finally:
+        db.close()
+
+
+def sync_s3_upload(file_path: str, bucket: str, s3_key: str, content_type: str):
+    """Synchronous worker wrapper to handle individual chunk uploads safely."""
+    s3_client.upload_file(
+        file_path, 
+        bucket, 
+        s3_key, 
+        ExtraArgs={'ContentType': content_type}
+    )
+
+
 async def transcode_to_hls(video_id: str, local_input_path: str, output_dir: str):
-    """
-    Spawns an async FFmpeg subprocess to transcode the input video into HLS format.
-    Slices the video into 6-second segments and optimizes it for streaming.
-    """
+    """Spawns an async FFmpeg subprocess to transcode the input video into HLS format."""
     manifest_path = os.path.join(output_dir, "playlist.m3u8")
     
-    # FFmpeg arguments to compile video to HLS 720p output format
     ffmpeg_cmd = [
         "./ffmpeg.exe", "-y", "-i", local_input_path,
         "-profile:v", "baseline", "-level", "3.0",
@@ -51,7 +96,6 @@ async def transcode_to_hls(video_id: str, local_input_path: str, output_dir: str
     )
     
     stdout, stderr = await process.communicate()
-    
     if process.returncode != 0:
         raise Exception(f"FFmpeg failed: {stderr.decode('utf-8', errors='ignore')}")
     print(f"✅ Transcoding complete for Video ID: {video_id}")
@@ -59,35 +103,51 @@ async def transcode_to_hls(video_id: str, local_input_path: str, output_dir: str
 
 
 async def process_video_event(msg_value, producer):
-    """
-    Handles the core pipeline logic for a single video event message.
-    """
+    """Handles the core pipeline logic for a single video event message."""
     video_id = msg_value.get("video_id")
     filename = msg_value.get("filename")
     
-    # Setup temporary local working directories
+    if not video_id or not filename:
+        return
+
+    # Normalize ID matching
+    video_id = os.path.splitext(video_id)[0]
+    print(f"\n⚡ Ingested processing assignment context for Video Target ID: [{video_id}]")
+
     local_raw_path = f"temp_raw_{filename}"
     local_output_dir = f"temp_out_{video_id}"
     os.makedirs(local_output_dir, exist_ok=True)
     
     try:
-        # 1. Download raw file from MinIO bucket
+        # 1. Download raw file from MinIO
         object_key = f"raw_{filename}"
         print(f"📥 Downloading {object_key} from MinIO...")
-        s3_client.download_file(RAW_BUCKET, object_key, local_raw_path)
+        await asyncio.to_thread(s3_client.download_file, RAW_BUCKET, object_key, local_raw_path)
         
         # 2. Run background transcoding process
         await transcode_to_hls(video_id, local_raw_path, local_output_dir)
         
-        # 3. Upload all generated HLS chunks (.ts and .m3u8) back to MinIO public bucket
+        # 3. 🚀 Concurrent S3 Uploads (Keeps Kafka heartbeats alive!)
         print(f"📤 Uploading HLS chunks to '{PROCESSED_BUCKET}/{video_id}/'...")
+        upload_tasks = []
         for file in os.listdir(local_output_dir):
             file_path = os.path.join(local_output_dir, file)
             s3_key = f"{video_id}/{file}"
-            s3_client.upload_file(file_path, PROCESSED_BUCKET, s3_key)
+            content_type = "application/x-mpegURL" if file.endswith(".m3u8") else "video/MP2T"
             
-        # 4. Notify downstream services by publishing an event to the 'processed-stream' topic
+            # Offload each file upload onto a thread pool concurrently
+            task = asyncio.to_thread(sync_s3_upload, file_path, PROCESSED_BUCKET, s3_key, content_type)
+            upload_tasks.append(task)
+            
+        # Execute all file uploads simultaneously without stalling the main loop
+        await asyncio.gather(*upload_tasks)
+            
         playback_url = f"{MINIO_ENDPOINT}/{PROCESSED_BUCKET}/{video_id}/playlist.m3u8"
+        
+        # 4. Persist the success state flags inside PostgreSQL
+        await asyncio.to_thread(sync_update_db_success, video_id, playback_url)
+        
+        # 5. Notify downstream services by publishing an event to Kafka
         success_payload = {
             "video_id": video_id,
             "status": "completed",
@@ -98,23 +158,27 @@ async def process_video_event(msg_value, producer):
         
     except Exception as e:
         print(f"❌ Pipeline Failure for video {video_id}: {str(e)}")
+        if video_id:
+            await asyncio.to_thread(sync_update_db_failed, video_id)
+            
     finally:
-        # Clean up temporary disk storage files
         if os.path.exists(local_raw_path):
             os.remove(local_raw_path)
         if os.path.exists(local_output_dir):
             shutil.rmtree(local_output_dir)
+        print(f"🧹 Cleaned up temporary execution artifacts for job: [{video_id}]")
 
 
 async def main():
     print("🤖 Initializing DistroStream Transcoder Worker...")
     
-    # Configure Kafka Consumer & Producer
     consumer = AIOKafkaConsumer(
         CONSUME_TOPIC,
         bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
         group_id="transcoder-group",
         auto_offset_reset="earliest",
+        enable_auto_commit=True,  # Let Kafka commit clean offsets
+        max_poll_interval_ms=300000,  # Gives worker 5 minutes max per video processing window
         value_deserializer=lambda m: json.loads(m.decode('utf-8'))
     )
     
@@ -128,9 +192,7 @@ async def main():
     print("🎧 Worker is live and actively listening for raw video events...")
     
     try:
-        # Endless event polling loop
         async for msg in consumer:
-            print(f"⚡ Received transcoding request event from Kafka!")
             await process_video_event(msg.value, producer)
     finally:
         await consumer.stop()
